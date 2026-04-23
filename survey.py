@@ -1,17 +1,66 @@
 import streamlit as st
 import csv
 import os
+import io
+import base64
 import smtplib
 from email.message import EmailMessage
 from pathlib import Path
 
 from dotenv import load_dotenv
 import pandas as pd
+import requests
 
 load_dotenv(Path(__file__).parent / ".env")
 
-CSV_FILE = Path(__file__).parent / "results.csv"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "asafasfdc/SFDC_TMT_BVS")
+GITHUB_CSV_PATH = "results.csv"
+CSV_HEADER = ["name", "A", "B", "C", "D", "E", "archetype"]
+
+
+def _github_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+
+
+def load_results() -> pd.DataFrame:
+    if not GITHUB_TOKEN:
+        return pd.DataFrame(columns=CSV_HEADER)
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_CSV_PATH}",
+            headers=_github_headers(),
+        )
+        if resp.status_code == 200:
+            content = base64.b64decode(resp.json()["content"]).decode("utf-8")
+            return pd.read_csv(io.StringIO(content))
+        return pd.DataFrame(columns=CSV_HEADER)
+    except Exception:
+        return pd.DataFrame(columns=CSV_HEADER)
+
+
+def save_results(df: pd.DataFrame):
+    if not GITHUB_TOKEN:
+        return
+    csv_content = df.to_csv(index=False)
+    encoded = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
+
+    resp = requests.get(
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_CSV_PATH}",
+        headers=_github_headers(),
+    )
+    sha = resp.json().get("sha") if resp.status_code == 200 else None
+
+    payload = {"message": "Update survey results", "content": encoded}
+    if sha:
+        payload["sha"] = sha
+
+    requests.put(
+        f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_CSV_PATH}",
+        headers=_github_headers(),
+        json=payload,
+    )
 
 QUESTIONS = [
     ("Q1", "A", "I love diving into a massive, messy Excel file to find the \"truth.\"",
@@ -72,12 +121,13 @@ def compute_archetype(counts: dict[str, int]) -> str:
 
 
 def save_result(name: str, counts: dict[str, int], archetype: str):
-    file_exists = CSV_FILE.exists()
-    with open(CSV_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["name", "A", "B", "C", "D", "E", "archetype"])
-        writer.writerow([name, counts["A"], counts["B"], counts["C"], counts["D"], counts["E"], archetype])
+    df = load_results()
+    new_row = pd.DataFrame([{
+        "name": name, "A": counts["A"], "B": counts["B"], "C": counts["C"],
+        "D": counts["D"], "E": counts["E"], "archetype": archetype
+    }])
+    df = pd.concat([df, new_row], ignore_index=True)
+    save_results(df)
 
 
 def show_admin_view():
@@ -97,11 +147,7 @@ def show_admin_view():
                 st.error("Access Denied")
         return
 
-    if not CSV_FILE.exists():
-        st.warning("No results yet. Have the team take the survey first!")
-        return
-
-    df = pd.read_csv(CSV_FILE)
+    df = load_results()
     if df.empty:
         st.warning("No results yet. Have the team take the survey first!")
         return
@@ -131,12 +177,11 @@ def show_admin_view():
             summary_lines.append(f"  {row['name']}: {row['archetype']} (A={row['A']} B={row['B']} C={row['C']} D={row['D']} E={row['E']})")
 
         summary_text = "\n".join(summary_lines)
-        csv_path = CSV_FILE.resolve()
 
         st.text_area("Summary Preview", summary_text, height=300)
         st.download_button(
             label="Download Results CSV",
-            data=open(csv_path, "r").read(),
+            data=df.to_csv(index=False),
             file_name="bvs_results.csv",
             mime="text/csv",
         )
